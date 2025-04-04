@@ -11,6 +11,25 @@
 #include <linux/uaccess.h>
 #include <linux/of_gpio.h>
 
+#define GPIO_PWR_UP 529
+#define GPIO_TRX_CE 539
+#define GPIO_TX_EN 534
+#define GPIO_DR 530
+
+#define TX_TIMEOUT 100
+
+#define NRF_BUF_SIZE 32
+#define RING_SIZE    32
+
+struct ringbuf {
+    unsigned head;
+    unsigned tail;
+    uint8_t data[RING_SIZE][NRF_BUF_SIZE];
+    struct mutex lock;
+};
+
+static struct ringbuf rx_ring;
+static struct ringbuf tx_ring;
 
 static struct class *nrf905_class = NULL;
 static struct device *nrf905_device = NULL;
@@ -33,6 +52,54 @@ static DEFINE_MUTEX(device_list_lock);
 
 static DEFINE_MUTEX(nrf905_cdev_lock);
 static DECLARE_WAIT_QUEUE_HEAD(nrf905_cdev_wq);
+static unsigned close_flag;
+
+static struct task_struct *rx_thread;
+
+static void ringbuf_init(struct ringbuf *rb) {
+    rb->head = 0;
+    rb->tail = 0;
+    mutex_init(&rb->lock);
+}
+
+static void ringbuf_put(struct ringbuf *rb, uint8_t *data) {
+    mutex_lock(&rb->lock);
+    memcpy(rb->data[rb->tail], data, NRF_BUF_SIZE);
+    rb->tail++;
+    rb->tail = rb->tail % RING_SIZE;
+    if (rb->tail == rb->head) {
+        pr_warn("ring overflow\n");
+        rb->head++;
+        rb->head = rb->head % RING_SIZE;
+    }
+    mutex_unlock(&rb->lock);
+}
+
+static int ringbuf_get(struct ringbuf *rb, uint8_t *data) {
+    int result = -1;
+
+    mutex_lock(&rb->lock);
+    if (rb->head != rb->tail) {
+        memcpy(data, rb->data[rb->head], NRF_BUF_SIZE);
+        rb->head++;
+        rb->head = rb->head % RING_SIZE;
+        result = 0;
+    }
+    mutex_unlock(&rb->lock);
+
+    return result;
+}
+
+static int ringbuf_avail(struct ringbuf *rb) {
+    int result = 0;
+    
+    mutex_lock(&rb->lock);
+    result = rb->head == rb->tail ? 0 : 1;
+    mutex_unlock(&rb->lock);
+    
+    return result;
+}
+
 
 
 /* ************************************************************************** *
@@ -336,9 +403,9 @@ static struct attribute_group nrf905_attribute_group = {
 
 
 static irqreturn_t dr_irq(int irq, void *dev_id) {
-    struct nrf905_drvdata *drvdata = dev_id;
+    //struct nrf905_drvdata *drvdata = dev_id;
 
-    int value = gpio_get_value(drvdata->gpio_dr);
+    int value = gpio_get_value(GPIO_DR);
 
     if (value) {
         wake_up_interruptible(&nrf905_cdev_wq);
@@ -348,75 +415,96 @@ static irqreturn_t dr_irq(int irq, void *dev_id) {
 }
 
 
+int rx_thread_func(void *pv)
+{
+    struct nrf905_drvdata *drvdata = pv;
+    uint8_t tmp_buf[NRF_BUF_SIZE];
+
+    pr_info("thread started");
+
+    while (!close_flag)
+    {
+        gpio_set_value(GPIO_TX_EN, 0);
+        gpio_set_value(GPIO_TRX_CE, 1);
+    
+        if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(GPIO_DR) | ringbuf_avail(&tx_ring) | close_flag)) {
+            pr_err("rx wait event error\n");
+            gpio_set_value(GPIO_TRX_CE, 0);
+            return 0;
+        }
+    
+        gpio_set_value(GPIO_TRX_CE, 0);
+
+        if (close_flag) {
+            pr_info("thread close_flag\n");
+            return 0;
+        }
+
+        if (ringbuf_avail(&tx_ring)) {
+            msleep(20);
+            do {
+                if (ringbuf_get(&tx_ring, tmp_buf) == -1) {
+                    pr_err("tx ring buffer empty\n");
+                    break;
+                }
+
+                nrf905_spi_w_tx_payload(drvdata->spi, tmp_buf, NRF_BUF_SIZE);
+            
+                msleep(20);
+            
+                gpio_set_value(GPIO_TX_EN, 1);
+                gpio_set_value(GPIO_TRX_CE, 1);
+
+                if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(GPIO_DR))) {
+                    pr_err("tx wait event error\n");
+                }
+            
+                gpio_set_value(GPIO_TRX_CE, 0);
+                msleep(20);
+            } while (ringbuf_avail(&tx_ring));
+        } else {
+            nrf905_spi_r_rx_payload(drvdata->spi, tmp_buf, NRF_BUF_SIZE);
+            ringbuf_put(&rx_ring, tmp_buf);
+        }
+    }
+
+    return 0;
+}
+
+
 static ssize_t nrf905_cdev_read(struct file *filp, char __user *buf, size_t count, loff_t *fpos) {
-    struct nrf905_drvdata *drvdata = filp->private_data;
-    long status;
-    uint8_t rxbuf[32];
+    int status;
+    uint8_t tmp_buf[NRF_BUF_SIZE];
 
     if (count != 32) {
         return -EMSGSIZE;
     }
 
-    mutex_lock(&nrf905_cdev_lock);
-
-    gpio_set_value(drvdata->gpio_tx_en, 0);
-    gpio_set_value(drvdata->gpio_trx_ce, 1);
-
-    if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(drvdata->gpio_dr))) {
-        gpio_set_value(drvdata->gpio_trx_ce, 0);
-
-        mutex_unlock(&nrf905_cdev_lock);
-
-        return -ERESTARTSYS;
-    }
-
-    gpio_set_value(drvdata->gpio_trx_ce, 0);
-
-    nrf905_spi_r_rx_payload(drvdata->spi, rxbuf, count);
-
-    mutex_unlock(&nrf905_cdev_lock);
-
-    status = copy_to_user(buf, rxbuf, count);
-    if (status < 0) {
-        return status;
-    } else {
+    status = ringbuf_get(&rx_ring, tmp_buf);
+    if (status == 0) {
+        status = copy_to_user(buf, tmp_buf, count);
         return count - status;
     }
+
+    return 0;
 }
 
 
 static ssize_t nrf905_cdev_write(struct file *filp, const char __user *buf, size_t count, loff_t *fpos) {
-    struct nrf905_drvdata *drvdata = filp->private_data;
     long status;
-    uint8_t txbuf[32];
+    uint8_t tx_buf[32];
 
     if (count != 32) {
         return -EMSGSIZE;
     }
 
-    status = copy_from_user(txbuf, buf, count);
+    status = copy_from_user(tx_buf, buf, count);
     if (status < 0) {
         return -EINVAL;
     }
 
-    mutex_lock(&nrf905_cdev_lock);
-
-    nrf905_spi_w_tx_payload(drvdata->spi, txbuf, count - status);
-
-    gpio_set_value(drvdata->gpio_tx_en, 1);
-    gpio_set_value(drvdata->gpio_trx_ce, 1);
-
-    if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(drvdata->gpio_dr))) {
-        gpio_set_value(drvdata->gpio_trx_ce, 0);
-
-        mutex_unlock(&nrf905_cdev_lock);
-
-        return -ERESTARTSYS;
-    }
-
-    gpio_set_value(drvdata->gpio_trx_ce, 0);
-
-    mutex_unlock(&nrf905_cdev_lock);
+    ringbuf_put(&tx_ring, tx_buf);
+    wake_up_interruptible(&nrf905_cdev_wq);
 
     return count - status;
 }
@@ -425,6 +513,12 @@ static ssize_t nrf905_cdev_write(struct file *filp, const char __user *buf, size
 static int nrf905_cdev_open(struct inode *inode, struct file *filp) {
     struct nrf905_drvdata *drvdata;
     int err = -ENXIO;
+    close_flag = 0;
+    
+    pr_info("open\n");
+
+    ringbuf_init(&rx_ring);
+    ringbuf_init(&tx_ring);
 
     mutex_lock(&device_list_lock);
 
@@ -445,6 +539,14 @@ static int nrf905_cdev_open(struct inode *inode, struct file *filp) {
     nonseekable_open(inode, filp);
 
     mutex_unlock(&device_list_lock);
+    
+    rx_thread = kthread_create(rx_thread_func, drvdata, "rx_thread"); 
+    if (rx_thread) {
+        wake_up_process(rx_thread); 
+    } else {
+        pr_err("cannot create kthread\n"); 
+    }
+
     return err;
 
 err_find_dev:
@@ -455,6 +557,10 @@ err_find_dev:
 
 static int nrf905_cdev_release(struct inode *inode, struct file *filp) {
     struct nrf905_drvdata *drvdata;
+
+    pr_err("close\n");
+    close_flag = 1;
+    wake_up_interruptible(&nrf905_cdev_wq);
 
     mutex_lock(&device_list_lock);
     drvdata = filp->private_data;
@@ -499,58 +605,24 @@ static int nrf905_probe(struct spi_device *spi) {
         return -ENOMEM;
     }
 
-    drvdata->gpio_pwr_up = of_get_named_gpio(spi->dev.of_node, "pwr_up_gpio", 0);
-    drvdata->gpio_trx_ce = of_get_named_gpio(spi->dev.of_node, "trx_ce_gpio", 0);
-    drvdata->gpio_tx_en = of_get_named_gpio(spi->dev.of_node, "tx_en_gpio", 0);
-    drvdata->gpio_dr = of_get_named_gpio(spi->dev.of_node, "dr_gpio", 0);
-
-    dev_info(&spi->dev, "gpio_pwr_up: %d\n", drvdata->gpio_pwr_up);
-    dev_info(&spi->dev, "gpio_trx_ce: %d\n", drvdata->gpio_trx_ce);
-    dev_info(&spi->dev, "gpio_tx_en: %d\n", drvdata->gpio_tx_en);
-    dev_info(&spi->dev, "gpio_dr: %d\n", drvdata->gpio_dr);
-
-    err = gpio_request_one(drvdata->gpio_pwr_up, GPIOF_DIR_OUT | GPIOF_INIT_LOW, "pwr_up");
+    err = request_irq(gpio_to_irq(GPIO_DR), dr_irq, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "dr_irq", drvdata);
     if (err < 0) {
-        dev_err(&spi->dev, "could not obtain pwr_up pin %d\n", drvdata->gpio_pwr_up);
+        pr_err("unable to request irq for dr pin %d\n", GPIO_DR);
         return err;
     }
 
-    err = gpio_request_one(drvdata->gpio_trx_ce, GPIOF_DIR_OUT | GPIOF_INIT_LOW, "trx_ce");
-    if (err < 0) {
-        dev_err(&spi->dev, "could not obtain trx_ce pin %d\n", drvdata->gpio_trx_ce);
-        return err;
-    }
-
-    err = gpio_request_one(drvdata->gpio_tx_en, GPIOF_DIR_OUT | GPIOF_INIT_LOW, "tx_en");
-    if (err < 0) {
-        dev_err(&spi->dev, "could not obtain tx_en pin %d\n", drvdata->gpio_tx_en);
-        return err;
-    }
-
-    err = gpio_request_one(drvdata->gpio_dr, GPIOF_DIR_IN, "dr");
-    if (err < 0) {
-        dev_err(&spi->dev, "could not obtain dr pin %d\n", drvdata->gpio_dr);
-        return err;
-    }
-
-    err = request_irq(gpio_to_irq(drvdata->gpio_dr), dr_irq, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "dr_irq", drvdata);
-    if (err < 0) {
-        dev_err(&spi->dev, "unable to request irq for dr pin %d\n", drvdata->gpio_dr);
-        return err;
-    }
-
-    gpio_set_value(drvdata->gpio_pwr_up, 0);
+    gpio_set_value(GPIO_PWR_UP, 0);
 
     // transition to PWR_DWN is not specified in the datasheet
     // 10ms should be more than enough, considering that the wakeup time is 3ms
     msleep(10);
 
-    gpio_set_value(drvdata->gpio_pwr_up, 1);
+    gpio_set_value(GPIO_PWR_UP, 1);
 
     // transition PWR_DWN -> ST_BY mode, i.e. wake up
     msleep(3);
 
-    spi->master->mode_bits = SPI_MODE_0;
+    //spi->master->mode_bits = SPI_MODE_0;
     spi->mode = SPI_MODE_0;
     spi->bits_per_word = 8;
 
@@ -589,7 +661,7 @@ static int nrf905_probe(struct spi_device *spi) {
 }
 
 
-static int nrf905_remove(struct spi_device *spi) {
+static void nrf905_remove(struct spi_device *spi) {
     struct nrf905_drvdata *drvdata = spi_get_drvdata(spi);
 
     dev_info(&spi->dev, "%s\n", __func__);
@@ -607,20 +679,18 @@ static int nrf905_remove(struct spi_device *spi) {
 
     mutex_unlock(&device_list_lock);
 
-    gpio_direction_output(drvdata->gpio_dr, 0);
-    free_irq(gpio_to_irq(drvdata->gpio_dr), drvdata);
-    gpio_free(drvdata->gpio_dr);
+    gpio_direction_output(GPIO_DR, 0);
+    free_irq(gpio_to_irq(GPIO_DR), drvdata);
+    gpio_free(GPIO_DR);
 
-    gpio_direction_output(drvdata->gpio_tx_en, 0);
-    gpio_free(drvdata->gpio_tx_en);
+    gpio_direction_output(GPIO_TX_EN, 0);
+    gpio_free(GPIO_TX_EN);
 
-    gpio_direction_output(drvdata->gpio_trx_ce, 0);
-    gpio_free(drvdata->gpio_trx_ce);
+    gpio_direction_output(GPIO_TRX_CE, 0);
+    gpio_free(GPIO_TRX_CE);
 
-    gpio_direction_output(drvdata->gpio_pwr_up, 0);
-    gpio_free(drvdata->gpio_pwr_up);
-
-    return 0;
+    gpio_direction_output(GPIO_PWR_UP, 0);
+    gpio_free(GPIO_PWR_UP);
 }
 
 
@@ -635,9 +705,63 @@ static struct spi_driver nrf905_driver = {
 
 
 int nrf905_init(void) {
+    int err;
     pr_info("%s\n", __func__);
 
-    nrf905_class = class_create(THIS_MODULE, "nrf905");
+    /*dev_info(&spi->dev, "gpio_pwr_up: %d\n", GPIO_PWR_UP);
+    dev_info(&spi->dev, "gpio_trx_ce: %d\n", GPIO_TRX_CE);
+    dev_info(&spi->dev, "gpio_tx_en: %d\n", GPIO_TX_EN);
+    dev_info(&spi->dev, "gpio_dr: %d\n", GPIO_DR);*/
+
+    if( gpio_is_valid( GPIO_PWR_UP ) == false )
+    {
+      pr_err("GPIO %d is not valid\n", GPIO_PWR_UP);
+      return -1;
+    }
+    if( (err = gpio_request( GPIO_PWR_UP, "pwr_up" )) < 0 )
+    {
+      pr_err("ERROR: GPIO %d request %d\n", GPIO_PWR_UP, err);
+      return -1;
+    }
+    gpio_direction_output( GPIO_PWR_UP, 1 );
+
+    if( gpio_is_valid( GPIO_TRX_CE ) == false )
+    {
+      pr_err("GPIO %d is not valid\n", GPIO_TRX_CE);
+      return -1;
+    }
+    if( gpio_request( GPIO_TRX_CE, "trx_ce" ) < 0 )
+    {
+      pr_err("ERROR: GPIO %d request\n", GPIO_TRX_CE);
+      return -1;
+    }
+    gpio_direction_output( GPIO_TRX_CE, 1 );
+
+    if( gpio_is_valid( GPIO_TX_EN ) == false )
+    {
+      pr_err("GPIO %d is not valid\n", GPIO_TX_EN);
+      return -1;
+    }
+    if( gpio_request( GPIO_TX_EN, "tx_en" ) < 0 )
+    {
+      pr_err("ERROR: GPIO %d request\n", GPIO_TX_EN);
+      return -1;
+    }
+    gpio_direction_output( GPIO_TX_EN, 1 );
+
+    if( gpio_is_valid( GPIO_DR ) == false )
+    {
+      pr_err("GPIO %d is not valid\n", GPIO_DR);
+      return -1;
+    }
+    if( gpio_request( GPIO_DR, "dr" ) < 0 )
+    {
+      pr_err("ERROR: GPIO %d request\n", GPIO_DR);
+      return -1;
+    }
+    gpio_direction_input( GPIO_DR);
+
+    nrf905_class = class_create("nrf905");
     if (IS_ERR(nrf905_class)) {
         pr_err("failed to register device class '%s'\n", "nrf905");
         return PTR_ERR(nrf905_class);
