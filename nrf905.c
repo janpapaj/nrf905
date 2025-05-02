@@ -432,16 +432,21 @@ int rx_thread_func(void *pv)
             gpio_set_value(GPIO_TRX_CE, 0);
             return 0;
         }
-    
-        gpio_set_value(GPIO_TRX_CE, 0);
 
+        if (gpio_get_value(GPIO_DR)) {
+            gpio_set_value(GPIO_TRX_CE, 0);
+            pr_err("rx");
+            nrf905_spi_r_rx_payload(drvdata->spi, tmp_buf, NRF_BUF_SIZE);
+            ringbuf_put(&rx_ring, tmp_buf);
+        }
+    
         if (close_flag) {
             pr_info("thread close_flag\n");
             return 0;
         }
 
         if (ringbuf_avail(&tx_ring)) {
-            msleep(20);
+            mutex_lock(&nrf905_cdev_lock);
             do {
                 if (ringbuf_get(&tx_ring, tmp_buf) == -1) {
                     pr_err("tx ring buffer empty\n");
@@ -455,18 +460,20 @@ int rx_thread_func(void *pv)
                 gpio_set_value(GPIO_TX_EN, 1);
                 gpio_set_value(GPIO_TRX_CE, 1);
 
-                if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(GPIO_DR))) {
+                if (wait_event_interruptible_timeout(nrf905_cdev_wq, gpio_get_value(GPIO_DR), msecs_to_jiffies(50)) == 0) {
                     pr_err("tx wait event error\n");
                 }
             
+                msleep(10);
                 gpio_set_value(GPIO_TRX_CE, 0);
-                msleep(20);
+                msleep(10);
             } while (ringbuf_avail(&tx_ring));
-        } else {
-            nrf905_spi_r_rx_payload(drvdata->spi, tmp_buf, NRF_BUF_SIZE);
-            ringbuf_put(&rx_ring, tmp_buf);
+            mutex_unlock(&nrf905_cdev_lock);
         }
     }
+
+    gpio_set_value(GPIO_TX_EN, 0);
+    gpio_set_value(GPIO_TRX_CE, 0);
 
     return 0;
 }
@@ -498,12 +505,14 @@ static ssize_t nrf905_cdev_write(struct file *filp, const char __user *buf, size
         return -EMSGSIZE;
     }
 
+    mutex_lock(&nrf905_cdev_lock);
     status = copy_from_user(tx_buf, buf, count);
     if (status < 0) {
         return -EINVAL;
     }
 
     ringbuf_put(&tx_ring, tx_buf);
+    mutex_unlock(&nrf905_cdev_lock);
     wake_up_interruptible(&nrf905_cdev_wq);
 
     return count - status;
@@ -558,7 +567,7 @@ err_find_dev:
 static int nrf905_cdev_release(struct inode *inode, struct file *filp) {
     struct nrf905_drvdata *drvdata;
 
-    pr_err("close\n");
+    pr_info("release\n");
     close_flag = 1;
     wake_up_interruptible(&nrf905_cdev_wq);
 
