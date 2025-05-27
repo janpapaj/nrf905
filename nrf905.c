@@ -408,6 +408,7 @@ static irqreturn_t dr_irq(int irq, void *dev_id) {
     int value = gpio_get_value(GPIO_DR);
 
     if (value) {
+        pr_err("irq dr");
         wake_up_interruptible(&nrf905_cdev_wq);
     }
 
@@ -433,9 +434,11 @@ int rx_thread_func(void *pv)
             return 0;
         }
 
+        pr_err("dr %d tx %d",  gpio_get_value(GPIO_DR), ringbuf_avail(&tx_ring));
+
         if (gpio_get_value(GPIO_DR)) {
             gpio_set_value(GPIO_TRX_CE, 0);
-            pr_err("rx");
+            //pr_err("rx");
             nrf905_spi_r_rx_payload(drvdata->spi, tmp_buf, NRF_BUF_SIZE);
             ringbuf_put(&rx_ring, tmp_buf);
         }
@@ -446,6 +449,8 @@ int rx_thread_func(void *pv)
         }
 
         if (ringbuf_avail(&tx_ring)) {
+            gpio_set_value(GPIO_TRX_CE, 0);
+            msleep(10);
             mutex_lock(&nrf905_cdev_lock);
             do {
                 if (ringbuf_get(&tx_ring, tmp_buf) == -1) {
@@ -455,16 +460,21 @@ int rx_thread_func(void *pv)
 
                 nrf905_spi_w_tx_payload(drvdata->spi, tmp_buf, NRF_BUF_SIZE);
             
-                msleep(20);
+                msleep(10);
             
                 gpio_set_value(GPIO_TX_EN, 1);
                 gpio_set_value(GPIO_TRX_CE, 1);
 
+                //pr_info("tx wait\n");
+
+                msleep(10);
                 if (wait_event_interruptible_timeout(nrf905_cdev_wq, gpio_get_value(GPIO_DR), msecs_to_jiffies(50)) == 0) {
                     pr_err("tx wait event error\n");
                 }
-            
                 msleep(10);
+                //pr_info("tx after\n");
+            
+                //msleep(20);
                 gpio_set_value(GPIO_TRX_CE, 0);
                 msleep(10);
             } while (ringbuf_avail(&tx_ring));
@@ -508,6 +518,7 @@ static ssize_t nrf905_cdev_write(struct file *filp, const char __user *buf, size
     mutex_lock(&nrf905_cdev_lock);
     status = copy_from_user(tx_buf, buf, count);
     if (status < 0) {
+        mutex_unlock(&nrf905_cdev_lock);
         return -EINVAL;
     }
 
